@@ -238,7 +238,7 @@ req.Header.Set("Authorization", authToken)
 
 ```bash
 # Run all agent run e2e tests (in-memory SQLite + miniredis, no Docker needed)
-cd /home/zhichyu/github.com/infiniflow/ragflow
+# Run from the repo root.
 go test -count=1 -v -run 'TestRunAgent_RealCanvas|TestRunAgent_RunTracker' ./internal/service/
 ```
 
@@ -271,7 +271,7 @@ canvas.Compile → cc.Workflow.Invoke → answer extraction
 **Test DSL data files** are in `internal/agent/dsl/testdata/`:
 - `agent_msg.json` — Agent+Message with Begin, LLM-powered agent component
 - `all.json` — Complex: Begin→UserFillUp→Switch→Loop→Message
-- `switch.json`, `resume.json`, `browser.json`, `subagent.json`, etc.
+- `switch.json`, `resume.json`, `dfx_picture_parser.json`, `questions_category.json`, `subaget.json`
 
 **Handler-level SSE streaming tests** in `internal/handler/agent_test.go` use a `stubChatRunner` that emits pre-configured `canvas.RunEvent` values without a real DB or eino runner, verifying:
 - SSE `Content-Type: text/event-stream`
