@@ -18,6 +18,7 @@ import json
 import os
 import re
 from abc import ABC
+from typing import Any
 import pandas as pd
 import pymysql
 import psycopg2
@@ -80,6 +81,160 @@ class ExeSQLParam(ToolParamBase):
 class ExeSQL(ToolBase, ABC):
     component_name = "ExeSQL"
 
+    # Statements that mutate or alter schema/data/permissions are blocked
+    # outright, regardless of how their variables are substituted. This is
+    # defense-in-depth on top of (never a substitute for) the per-value
+    # escaping/parameterization in `_resolve_sql_statement`: it is the only
+    # protection available for the one case that mechanism deliberately
+    # does not touch -- a whole statement bound to a single variable whose
+    # value is meant to BE a complete SQL statement (see the "whole
+    # statement is one variable" branch below).
+    _BLOCKED_STATEMENT_PREFIX = re.compile(
+        r"^(insert|update|delete|drop|alter|truncate|create|grant|revoke|replace|exec(?:ute)?|call|merge)\b",
+        flags=re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _split_raw_statements(sql: str) -> list[str]:
+        """Split *sql* on ";" into individual statement strings, applying the
+        cleanup this tool has always applied per statement (stripping
+        Markdown code fences and "[ID:n]" citation tags, dropping blanks).
+
+        This must always run on text that has *not* had any canvas/flow
+        variable substituted into it yet (see `_resolve_sql_statement`) --
+        otherwise a substituted value containing its own ";" could
+        terminate the current statement and smuggle in an extra one that
+        runs as its own top-level statement.
+        """
+        stmts = []
+        for chunk in sql.split(";"):
+            stmt = chunk.replace("```", "").strip()
+            if not stmt:
+                continue
+            stmt = re.sub(r"\[ID:[0-9]+\]", "", stmt)
+            stmts.append(stmt)
+        return stmts
+
+    def _resolve_sql_statement(self, raw_stmt: str) -> list[tuple[str, Any]]:
+        """Resolve the canvas/flow variables referenced by one
+        *unsubstituted* SQL statement into ready-to-run (sql_text, params)
+        pairs.
+
+        `params` is:
+          - `None` -- `sql_text` is complete SQL, run as `cursor.execute(sql_text)`.
+          - a `dict` -- `sql_text` contains "%(name)s" placeholders for
+            pyformat-paramstyle drivers (PyMySQL, psycopg2); run as
+            `cursor.execute(sql_text, params)`.
+          - a `list` -- `sql_text` contains "?" placeholders, one per list
+            entry in left-to-right order, for qmark-paramstyle drivers
+            (pyodbc); run the same way.
+
+        A substituted value is never spliced into `sql_text` as raw,
+        unescaped text -- it is always bound as a parameter, or (for
+        dialects whose driver this code does not bind parameters through
+        directly) substituted only after correct dialect string-literal
+        escaping. The one narrow exception is the "whole statement is one
+        variable" branch below, which does not weaken this guarantee for
+        variables used as values.
+        """
+        var_refs = self.get_input_elements_from_text(raw_stmt)
+        args: dict[str, str] = {}
+        for k, o in var_refs.items():
+            v = o["value"]
+            if not isinstance(v, str):
+                try:
+                    v = json.dumps(v, ensure_ascii=False)
+                except Exception:
+                    v = str(v)
+            args[k] = v
+            self.set_input_value(k, v)
+
+        if not var_refs:
+            return [(raw_stmt, None)]
+
+        # Whole-statement case: the statement is *exactly* one variable
+        # reference and nothing else, e.g. `sql: "{Agent:xyz@content}"`.
+        # This is the documented text-to-SQL-agent pattern (an upstream
+        # LLM/agent component emits a complete query, or several ";"-
+        # separated ones, and ExeSQL just runs it) -- the "value" here IS
+        # the SQL, not a value to quote/bind into it, so treating it as a
+        # scalar would break the query rather than secure it. This is
+        # unchanged from the tool's pre-fix behavior for this exact shape,
+        # including re-splitting the substituted text on ";" the same way
+        # the outer statement list is built; it relies on the DDL/DML/etc.
+        # blocklist as its (pre-existing) defense-in-depth.
+        if len(var_refs) == 1:
+            (only_key,) = var_refs.keys()
+            if raw_stmt.strip() == "{%s}" % only_key:
+                substituted = self.string_format(raw_stmt, {only_key: args[only_key]})
+                return [(s, None) for s in self._split_raw_statements(substituted)]
+
+        # Every other case: the statement is fixed SQL text (written by the
+        # flow designer, or an agent-authored template) with one or more
+        # values spliced in -- e.g. `SELECT * FROM orders WHERE customer_id
+        # = {customer_id}`. Every such value is treated strictly as a VALUE:
+        # it is bound through the target driver's own parameter mechanism
+        # so it can never terminate the token it sits in, start a new
+        # statement, or comment out the remainder of the query, no matter
+        # what characters it contains.
+        #
+        # NOTE on identifier positions: a bind parameter (like a quoted
+        # literal) can only ever stand in for a *value*, never for an
+        # identifier such as a table or column name -- no SQL dialect's
+        # placeholder syntax supports that. No shipped ExeSQL template or
+        # test in this repository uses a variable for an identifier; if a
+        # flow did, this now produces a SQL syntax error instead of
+        # executing unescaped, attacker-influenced text as an identifier,
+        # which is the safe direction for that trade-off to fail in.
+        if self._param.db_type in ("mysql", "mariadb", "oceanbase", "postgres"):
+            # Both PyMySQL and psycopg2 use Python "%"-style pyformat
+            # placeholders and interpolate the query through "%"
+            # internally, so any literal "%" already in the template (e.g.
+            # `LIKE '%foo%'`) must be doubled first. Values themselves need
+            # no such treatment -- the driver inserts them, already
+            # escaped, after this step, so a "%" inside a *value* is never
+            # re-interpreted.
+            templated = raw_stmt.replace("%", "%%")
+            alternation = "|".join(re.escape(k) for k in var_refs)
+            templated = re.sub(r"\{(%s)\}" % alternation, lambda m: "%%(%s)s" % m.group(1), templated)
+            return [(templated, dict(args))]
+
+        if self._param.db_type == "mssql":
+            params: list[str] = []
+
+            def _qmark(m):
+                params.append(args[m.group(1)])
+                return "?"
+
+            alternation = "|".join(re.escape(k) for k in var_refs)
+            templated = re.sub(r"\{(%s)\}" % alternation, _qmark, raw_stmt)
+            return [(templated, params)]
+
+        # Trino and IBM DB2: this tool does not drive either driver's
+        # bind-parameter API directly, so fall back to correct dialect
+        # string-literal escaping instead (both use plain ANSI-SQL string
+        # literals: wrap in single quotes, double any embedded single
+        # quote, no backslash escapes).
+        templated = raw_stmt
+        for k, v in args.items():
+            templated = re.sub(r"\{%s\}" % re.escape(k), lambda _m, val=v: ExeSQL._quote_sql_literal(val), templated)
+        return [(templated, None)]
+
+    @staticmethod
+    def _quote_sql_literal(value: str) -> str:
+        """Render *value* as a safely-escaped ANSI-SQL string literal.
+
+        Used only for dialects (Trino, IBM DB2) whose Python driver this
+        tool does not bind parameters through directly. NUL bytes are
+        stripped: they are not valid inside a SQL string literal in any
+        supported dialect, and some engines/drivers silently truncate on
+        them, which could otherwise hide the tail of an injected payload
+        from anyone reading the executed SQL back.
+        """
+        if value is None:
+            return "NULL"
+        return "'" + value.replace("\x00", "").replace("'", "''") + "'"
+
     @timeout(int(os.environ.get("COMPONENT_EXEC_TIMEOUT", 60)))
     def _invoke(self, **kwargs):
         if self.check_if_canceled("ExeSQL processing"):
@@ -108,22 +263,20 @@ class ExeSQL(ToolBase, ABC):
         if self.check_if_canceled("ExeSQL processing"):
             return
 
-        vars = self.get_input_elements_from_text(sql)
-        args = {}
-        for k, o in vars.items():
-            args[k] = o["value"]
-            if not isinstance(args[k], str):
-                try:
-                    args[k] = json.dumps(args[k], ensure_ascii=False)
-                except Exception:
-                    args[k] = str(args[k])
-            self.set_input_value(k, args[k])
-        sql = self.string_format(sql, args)
+        # Security: split into individual statements *before* substituting
+        # any canvas/flow variable, and never splice a substituted value
+        # into the SQL text as a raw, unescaped string. See
+        # `_resolve_sql_statement` for the full rationale. Splitting first
+        # is what stops a substituted value containing its own ";" from
+        # being able to smuggle in an extra top-level statement; escaping/
+        # binding every value is what stops it from breaking out of the
+        # token (string literal, comparison, etc.) it was substituted into.
+        statements: list[tuple[str, Any]] = []
+        for raw_stmt in self._split_raw_statements(sql):
+            statements.extend(self._resolve_sql_statement(raw_stmt))
 
         if self.check_if_canceled("ExeSQL processing"):
             return
-
-        sqls = sql.split(";")
         if self._param.db_type in ["mysql", "mariadb"]:
             db = pymysql.connect(db=self._param.database, user=self._param.username, host=self._param.host,
                                  port=self._param.port, password=self._param.password)
@@ -199,14 +352,15 @@ class ExeSQL(ToolBase, ABC):
             try:
                 sql_res = []
                 formalized_content = []
-                for single_sql in sqls:
+                for single_sql, _params in statements:
                     if self.check_if_canceled("ExeSQL processing"):
                         return
 
-                    single_sql = single_sql.replace("```", "").strip()
-                    if not single_sql:
+                    if self._BLOCKED_STATEMENT_PREFIX.match(single_sql):
+                        msg = "For security reasons, this type of statement is not supported."
+                        sql_res.append({"content": msg})
+                        formalized_content.append(msg)
                         continue
-                    single_sql = re.sub(r"\[ID:[0-9]+\]", "", single_sql)
 
                     try:
                         stmt = ibm_db.exec_immediate(conn, single_sql)
@@ -256,20 +410,20 @@ class ExeSQL(ToolBase, ABC):
         try:
             sql_res = []
             formalized_content = []
-            for single_sql in sqls:
+            for single_sql, params in statements:
                 if self.check_if_canceled("ExeSQL processing"):
                     return
 
-                single_sql = single_sql.replace('```', '').strip()
-                if not single_sql:
-                    continue
-                single_sql = re.sub(r"\[ID:[0-9]+\]", "", single_sql)
-                if re.match(r"^(insert|update|delete)\b", single_sql, flags=re.IGNORECASE):
-                    sql_res.append({"content": "For security reasons, INSERT, UPDATE, and DELETE statements are not supported."})
-                    formalized_content.append("For security reasons, INSERT, UPDATE, and DELETE statements are not supported.")
+                if self._BLOCKED_STATEMENT_PREFIX.match(single_sql):
+                    msg = "For security reasons, this type of statement is not supported."
+                    sql_res.append({"content": msg})
+                    formalized_content.append(msg)
                     continue
                 try:
-                    cursor.execute(single_sql)
+                    if params is None:
+                        cursor.execute(single_sql)
+                    else:
+                        cursor.execute(single_sql, params)
                     if cursor.rowcount == 0:
                         sql_res.append({"content": "No record in the database!"})
                         break
